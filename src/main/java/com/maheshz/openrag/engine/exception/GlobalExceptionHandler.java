@@ -31,6 +31,15 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         return problemDetail;
     }
 
+    // SENIOR FIX: The Silent Drop
+    // Catches Tomcat's broken pipe errors when a user closes their browser mid-stream.
+    // Returning 'void' prevents Spring from trying to write a JSON ProblemDetail into a dead text stream!
+    @ExceptionHandler(java.io.IOException.class)
+    public void handleClientDisconnect(java.io.IOException ex) {
+        // We use log.trace() or log.debug() so it doesn't pollute the INFO logs in production.
+        log.debug("Client disconnected during an active connection. Stream closed safely.");
+    }
+
     @ExceptionHandler(Exception.class)
     public ProblemDetail handleGenericException(Exception ex) {
         log.error("Unexpected error occurred", ex);

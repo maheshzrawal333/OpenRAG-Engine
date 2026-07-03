@@ -1,67 +1,171 @@
+/**
+ * Enterprise API Service
+ * Implements centralized network interception, timeout management, and JWT Auth injection.
+ */
 const ApiService = {
+
+    // SENIOR FIX #9: Default timeout reduced to 15 seconds. Only long-running tasks get more.
+    _fetch: async (endpoint, options = {}, timeoutMs = 15000) => {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+        // ARCHITECTURAL DEBT NOTE (#2): In a production environment, this token should be
+        // managed via an HttpOnly cookie set by the backend, not localStorage, to prevent XSS exfiltration.
+        const token = localStorage.getItem('auth_token');
+        const headers = {
+            ...options.headers,
+            ...(token && { 'Authorization': `Bearer ${token}` })
+        };
+
+        try {
+            const response = await fetch(endpoint, {
+                ...options,
+                headers,
+                signal: controller.signal
+            });
+
+            if (!response.ok) {
+                // Safely parse Spring Boot's ProblemDetail JSON if it exists
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || errorData.message || `HTTP ${response.status} - ${response.statusText}`);
+            }
+
+            // HTTP 204 No Content does not have a JSON body to parse
+            if (response.status === 204) return true;
+
+            return await response.json();
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                throw new Error(`Request timed out after ${timeoutMs / 1000} seconds.`);
+            }
+            throw error;
+        } finally {
+            clearTimeout(timeoutId);
+        }
+    },
+
+    // ==========================================
+    // INGESTION & EVIDENCE API
+    // ==========================================
     uploadEvidence: async (file, folderId, caseId) => {
         const formData = new FormData();
         formData.append("file", file);
         formData.append("folderId", folderId);
-        const response = await fetch('/api/knowledge/upload', { method: 'POST', headers: { 'X-Tenant-ID': caseId }, body: formData });
-        if (!response.ok) throw new Error("Upload failed");
-        return await response.json();
+
+        // Uploads might take longer, but the SSE stream handles the bulk of the wait.
+        // We'll give the initial upload 30 seconds.
+        return await ApiService._fetch('/api/knowledge/upload', {
+            method: 'POST',
+            headers: { 'X-Tenant-ID': caseId }, // Browser automatically sets multipart boundary
+            body: formData
+        }, 30000);
     },
-    askStructuredQuestion: async (question, folderId, caseId, modelName) => {
-        const response = await fetch('/api/forensics/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': caseId }, body: JSON.stringify({ question, folderId, model: modelName }) });
-        if (!response.ok) throw new Error("Analysis failed"); return await response.json();
-    },
-    generateReport: async (validatedEvidenceList, caseId, modelName) => {
-        const response = await fetch('/api/forensics/report', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': caseId }, body: JSON.stringify({ evidence: validatedEvidenceList, model: modelName }) });
-        if (!response.ok) throw new Error("Report generation failed"); return await response.json();
-    },
+
     getFiles: async (folderId, caseId) => {
-        const queryFolder = folderId === "root" ? "root" : folderId;
-        const response = await fetch(`/api/knowledge/documents?folderId=${queryFolder}`, { method: 'GET', headers: { 'X-Tenant-ID': caseId }});
-        if (!response.ok) throw new Error("Fetch failed"); return await response.json();
+        // SENIOR FIX #13: Encode URI Component for folderId
+        const queryFolder = folderId === "root" ? "root" : encodeURIComponent(folderId);
+        return await ApiService._fetch(`/api/knowledge/documents?folderId=${queryFolder}`, {
+            method: 'GET',
+            headers: { 'X-Tenant-ID': caseId }
+        });
     },
+
     deleteFile: async (documentId, caseId) => {
-        const response = await fetch(`/api/knowledge/documents/${documentId}`, { method: 'DELETE', headers: { 'X-Tenant-ID': caseId }});
-        if (!response.ok) throw new Error("Delete failed"); return true;
+        return await ApiService._fetch(`/api/knowledge/documents/${encodeURIComponent(documentId)}`, {
+            method: 'DELETE',
+            headers: { 'X-Tenant-ID': caseId }
+        });
     },
+
+    // ==========================================
+    // FOLDER HIERARCHY API
+    // ==========================================
     getFolders: async (parentFolderId, caseId) => {
-        let url = `/api/folders` + (parentFolderId && parentFolderId !== "root" ? `?parentFolderId=${encodeURIComponent(parentFolderId)}` : "");
-        const response = await fetch(url, { method: 'GET', headers: { 'X-Tenant-ID': caseId }});
-        if (!response.ok) throw new Error("Fetch folders failed"); return await response.json();
+        const url = `/api/folders` + (parentFolderId && parentFolderId !== "root" ? `?parentFolderId=${encodeURIComponent(parentFolderId)}` : "");
+        return await ApiService._fetch(url, {
+            method: 'GET',
+            headers: { 'X-Tenant-ID': caseId }
+        });
     },
+
     createFolder: async (name, parentFolderId, caseId) => {
-        let url = `/api/folders?name=${encodeURIComponent(name)}` + (parentFolderId && parentFolderId !== "root" ? `&parentFolderId=${encodeURIComponent(parentFolderId)}` : "");
-        const response = await fetch(url, { method: 'POST', headers: { 'X-Tenant-ID': caseId }});
-        if (!response.ok) throw new Error("Create folder failed"); return await response.json();
+        const payload = {
+            name: name,
+            parentFolderId: parentFolderId === "root" ? null : parentFolderId
+        };
+
+        return await ApiService._fetch('/api/folders', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Tenant-ID': caseId
+            },
+            body: JSON.stringify(payload)
+        });
     },
+
     renameFolder: async (folderId, caseId, newName) => {
-        const response = await fetch(`/api/folders/${folderId}/rename`, {
+        return await ApiService._fetch(`/api/folders/${encodeURIComponent(folderId)}/rename`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': caseId },
             body: JSON.stringify({ name: newName })
         });
-        if (!response.ok) throw new Error("Rename failed"); return await response.json();
     },
+
     deleteFolder: async (folderId, caseId) => {
-        const response = await fetch(`/api/folders/${folderId}`, { method: 'DELETE', headers: { 'X-Tenant-ID': caseId }});
-        if (!response.ok) throw new Error("Delete failed. Folder might not be empty."); return true;
+        return await ApiService._fetch(`/api/folders/${encodeURIComponent(folderId)}`, {
+            method: 'DELETE',
+            headers: { 'X-Tenant-ID': caseId }
+        });
     },
+
+    // ==========================================
+    // AI FORENSICS API
+    // ==========================================
+    askStructuredQuestion: async (question, folderIds, caseId, modelName) => {
+        // SENIOR FIX #9: LLM inference needs a longer timeout (120 seconds)
+        return await ApiService._fetch('/api/forensics/analyze', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': caseId },
+            body: JSON.stringify({ question, folderIds, model: modelName })
+        }, 120000);
+    },
+
+    generateReport: async (validatedEvidenceList, caseId, modelName) => {
+        // SENIOR FIX #9: Report synthesis needs a longer timeout (120 seconds)
+        return await ApiService._fetch('/api/forensics/report', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': caseId },
+            body: JSON.stringify({ evidence: validatedEvidenceList, model: modelName })
+        }, 120000);
+    },
+
+    // ==========================================
+    // SYSTEM & TENANT ADMIN API
+    // ==========================================
     getTenants: async () => {
-        const response = await fetch('/api/admin/tenants');
-        if (!response.ok) throw new Error("Fetch cases failed"); return await response.json();
+        return await ApiService._fetch('/api/admin/tenants', { method: 'GET' });
     },
-    // SENIOR FIX: Restored the missing API method
+
     createTenant: async (id, name) => {
-        const response = await fetch(`/api/admin/tenants?id=${encodeURIComponent(id)}&name=${encodeURIComponent(name)}`, { method: 'POST', headers: { 'X-Tenant-ID': id }});
-        if (!response.ok) throw new Error("Create case failed"); return await response.json();
+        return await ApiService._fetch(`/api/admin/tenants?id=${encodeURIComponent(id)}&name=${encodeURIComponent(name)}`, {
+            method: 'POST',
+            headers: { 'X-Tenant-ID': id }
+        });
     },
+
     getModels: async () => {
         try {
-            const response = await fetch('/api/admin/models');
-            if (response.ok) return await response.json();
+            // Very short timeout for pinging local models
+            return await ApiService._fetch('/api/admin/models', { method: 'GET' }, 3000);
         } catch (e) {
-            console.warn("Model endpoint unavailable, falling back to safe local default.");
+            console.warn("Backend model endpoint unavailable. Failing over to local offline inventory.", e);
+            return [
+                "llama3.2:3b",
+                "qwen2.5-coder:7b",
+                "deepseek-r1:8b",
+                "deepseek-coder-v2:16b"
+            ];
         }
-        return ["llama3.2:3b"];
     }
 };

@@ -2,18 +2,14 @@ package com.maheshz.openrag.engine.service;
 
 import com.maheshz.openrag.engine.domain.JobStatus;
 import com.maheshz.openrag.engine.domain.KnowledgeDocument;
-import com.maheshz.openrag.engine.exception.RAGProcessingException;
 import com.maheshz.openrag.engine.repository.DocumentRepository;
+import com.maheshz.openrag.engine.service.storage.StorageService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.io.File;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
 import java.util.UUID;
 
 @Service
@@ -23,14 +19,22 @@ public class IngestionOrchestrator {
 
     private final AsyncIngestionWorker asyncIngestionWorker;
     private final DocumentRepository documentRepository;
+    private final StorageService storageService;
 
-    public IngestionOrchestrator(AsyncIngestionWorker asyncIngestionWorker, DocumentRepository documentRepository) {
+    public IngestionOrchestrator(AsyncIngestionWorker asyncIngestionWorker,
+                                 DocumentRepository documentRepository,
+                                 StorageService storageService) {
         this.asyncIngestionWorker = asyncIngestionWorker;
         this.documentRepository = documentRepository;
+        this.storageService = storageService;
     }
 
+    /**
+     * SENIOR FIX: Removed @Transactional.
+     * We cannot block a database connection while streaming 50MB files to S3/MinIO.
+     */
     public String initiateFileUpload(MultipartFile file, String tenantId, String folderId) {
-        // SENIOR SECURITY FIX: Strip malicious path climbing characters (e.g., ../../../)
+
         String rawFilename = file.getOriginalFilename() != null ? file.getOriginalFilename() : "unknown_file";
         String sanitizedFilename = Paths.get(rawFilename).getFileName().toString();
 
@@ -41,31 +45,33 @@ public class IngestionOrchestrator {
 
         String jobId = UUID.randomUUID().toString();
 
+        // 1. Create the persistent tracker in the database
         KnowledgeDocument tracker = new KnowledgeDocument();
         tracker.setJobId(jobId);
         tracker.setTenantId(tenantId);
         tracker.setFolderId(folderId);
-        tracker.setFileName(sanitizedFilename); // Use secured name
+        tracker.setFileName(sanitizedFilename);
         tracker.setStatus(JobStatus.PENDING);
 
+        // Micro-transaction: Opens a connection, saves, and releases the connection instantly.
         KnowledgeDocument savedTracker = documentRepository.saveAndFlush(tracker);
 
-        // Pass the secured name to the temp file creator
-        File tempFile = createTempFile(file, sanitizedFilename);
+        try {
+            // 2. Network I/O: Upload to Cloud Storage
+            // This takes time, but no database connections are being held hostage!
+            String objectKey = storageService.uploadFile(file, tenantId, savedTracker.getId());
 
-        log.info("Dispatched async ingestion job: {} for file: {}", jobId, sanitizedFilename);
-        asyncIngestionWorker.processFileAsync(tempFile, savedTracker);
+            // 3. Dispatch the async ingestion job
+            log.info("Dispatched distributed async ingestion job: {} for cloud file: {}", jobId, objectKey);
+            asyncIngestionWorker.processFileAsync(objectKey, savedTracker);
+
+        } catch (Exception e) {
+            // Compensating Transaction: If S3 fails, delete the tracker so we don't have zombie records
+            log.error("S3 upload failed. Rolling back database tracker for job: {}", jobId);
+            documentRepository.delete(savedTracker);
+            throw new RuntimeException("Failed to initiate file upload pipeline.", e);
+        }
 
         return jobId;
-    }
-
-    private File createTempFile(MultipartFile file, String sanitizedFilename) {
-        try {
-            Path tempPath = Files.createTempFile("ingest-", "-" + sanitizedFilename);
-            Files.copy(file.getInputStream(), tempPath, StandardCopyOption.REPLACE_EXISTING);
-            return tempPath.toFile();
-        } catch (Exception e) {
-            throw new RAGProcessingException("Failed to store uploaded file securely.", e);
-        }
     }
 }

@@ -3,6 +3,7 @@ package com.maheshz.openrag.engine.service;
 import com.maheshz.openrag.engine.domain.Folder;
 import com.maheshz.openrag.engine.repository.DocumentRepository;
 import com.maheshz.openrag.engine.repository.FolderRepository;
+import com.maheshz.openrag.engine.repository.VectorCleanupRepository;
 import com.maheshz.openrag.engine.security.TenantContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -15,15 +16,26 @@ public class FolderService {
 
     private final FolderRepository folderRepository;
     private final DocumentRepository documentRepository;
+    private final VectorCleanupRepository vectorCleanupRepository;
 
-    public FolderService(FolderRepository folderRepository, DocumentRepository documentRepository) {
+    public FolderService(FolderRepository folderRepository, DocumentRepository documentRepository, VectorCleanupRepository vectorCleanupRepository) {
         this.folderRepository = folderRepository;
         this.documentRepository = documentRepository;
+        this.vectorCleanupRepository = vectorCleanupRepository;
     }
 
     @Transactional
     public Folder createFolder(String name, String parentFolderId) {
         String tenantId = getValidatedTenantId();
+
+        if (parentFolderId != null && !parentFolderId.equals("root")) {
+            boolean ownsParent = folderRepository.findById(parentFolderId)
+                    .map(f -> f.getTenantId().equals(tenantId))
+                    .orElse(false);
+            if (!ownsParent) {
+                throw new IllegalArgumentException("Invalid Parent Folder. Access Denied.");
+            }
+        }
 
         Folder folder = new Folder();
         folder.setId(UUID.randomUUID().toString());
@@ -34,7 +46,6 @@ public class FolderService {
         return folderRepository.save(folder);
     }
 
-    // SENIOR OPTIMIZATION: readOnly = true improves database performance for fetch queries
     @Transactional(readOnly = true)
     public List<Folder> getFolders(String parentFolderId) {
         String tenantId = getValidatedTenantId();
@@ -53,49 +64,34 @@ public class FolderService {
         return folderRepository.save(folder);
     }
 
-    // --- UPGRADED: Recursive Cascading Delete ---
     @Transactional
     public void deleteFolder(String folderId) {
         String tenantId = getValidatedTenantId();
 
-        // 1. Verify the target folder exists and belongs to the active case
         Folder targetFolder = folderRepository.findById(folderId)
                 .filter(f -> f.getTenantId().equals(tenantId))
                 .orElseThrow(() -> new IllegalArgumentException("Folder not found or access denied."));
 
-        // 2. Trigger the recursive wipe (bottom-up deletion)
         deleteFolderContentsRecursively(folderId, tenantId);
-
-        // 3. Finally, delete the targeted parent folder itself
         folderRepository.delete(targetFolder);
     }
 
-    /**
-     * Helper method that digs into the folder tree, deleting all files and nested folders from the bottom up.
-     */
     private void deleteFolderContentsRecursively(String parentFolderId, String tenantId) {
-        // Step A: Find and wipe all files sitting directly inside this specific folder
+        // SENIOR FIX: Wipe AI Vectors before deleting the relational file tracker
         documentRepository.findByFolderIdAndTenantId(parentFolderId, tenantId)
-                .forEach(documentRepository::delete);
+                .forEach(doc -> {
+                    vectorCleanupRepository.wipeVectorsByDocumentId(doc.getId(), tenantId);
+                    documentRepository.delete(doc);
+                });
 
-        // (Note: If you eventually add VectorStore deletion here, you would collect the document IDs
-        //  from the query above and pass them to vectorStore.delete(idList) to wipe AI memory).
-
-        // Step B: Find all sub-folders inside this folder
         List<Folder> subFolders = folderRepository.findByTenantIdAndParentFolderId(tenantId, parentFolderId);
 
-        // Step C: For every sub-folder found, dig deeper (Recursion), then delete the empty shell
         for (Folder subFolder : subFolders) {
-            deleteFolderContentsRecursively(subFolder.getId(), tenantId); // Dig deeper
-            folderRepository.delete(subFolder); // Delete the empty folder shell
+            deleteFolderContentsRecursively(subFolder.getId(), tenantId);
+            folderRepository.delete(subFolder);
         }
     }
 
-    /**
-     * SENIOR GUARDRAIL: Centralized Tenant Validation.
-     * Prevents NullPointerExceptions and database integrity violations if a request
-     * slips through without an active Case ID.
-     */
     private String getValidatedTenantId() {
         String tenantId = TenantContextHolder.getTenantId();
         if (tenantId == null || tenantId.trim().isEmpty()) {

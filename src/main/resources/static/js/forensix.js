@@ -1,11 +1,14 @@
 /**
- * ForensiX - Human-In-The-Loop Architecture
+ * ForensiX - Enterprise Human-In-The-Loop Architecture
  */
 
 let chatHistory = {};
 let activeMessageId = null;
 let verifiedFacts = [];
 let selectedContexts = new Map();
+
+// SENIOR FIX #5: Generation counter to prevent out-of-order async race conditions when switching cases
+let caseGeneration = 0;
 
 const elements = {
     caseId: document.getElementById('caseId'),
@@ -21,14 +24,12 @@ const elements = {
     verifiedCount: document.getElementById('verifiedCount')
 };
 
-// UTILITY: Safe class toggling avoids silent failures of classList.replace
 function swapClass(el, oldCls, newCls) {
     if (!el) return;
     if (oldCls) el.classList.remove(oldCls);
     if (newCls) el.classList.add(newCls);
 }
 
-// UTILITY: Security escape for untrusted AI & File System data
 function escapeHTML(str) {
     if (str === null || str === undefined) return '';
     return String(str)
@@ -40,17 +41,20 @@ function escapeHTML(str) {
 }
 
 const CustomModal = {
-    _timeoutId: null, // SENIOR FIX: Track timeout to prevent race conditions
+    _timeoutId: null,
+    _lastActiveElement: null,
 
     show: (title, message, type, confirmBtnText, confirmBtnColorClass, onConfirmCallback) => {
         if (CustomModal._timeoutId) clearTimeout(CustomModal._timeoutId);
+
+        // SENIOR FIX #15: Store the element that had focus before opening the modal
+        CustomModal._lastActiveElement = document.activeElement;
 
         const overlay = document.getElementById('modalOverlay');
         const content = document.getElementById('modalContent');
         const input = document.getElementById('modalInput');
         const confirmBtn = document.getElementById('modalConfirm');
 
-        // innerText is naturally safe from XSS
         document.getElementById('modalTitle').innerText = title;
         document.getElementById('modalBody').innerText = message;
 
@@ -63,11 +67,11 @@ const CustomModal = {
             setTimeout(() => input.focus(), 50);
         } else {
             input.classList.add('hidden');
+            confirmBtn.focus();
         }
 
         overlay.classList.remove('hidden');
         overlay.classList.add('flex');
-
         setTimeout(() => swapClass(content, 'scale-95', 'scale-100'), 10);
 
         const newConfirmBtn = confirmBtn.cloneNode(true);
@@ -81,7 +85,24 @@ const CustomModal = {
         });
 
         document.getElementById('modalCancel').onclick = CustomModal.close;
+
+        // SENIOR FIX #15: Escape to close & Backdrop click to close
+        const keyHandler = (e) => {
+            if (e.key === 'Escape') {
+                CustomModal.close();
+                document.removeEventListener('keydown', keyHandler);
+            }
+        };
+        document.addEventListener('keydown', keyHandler);
+
+        overlay.onclick = (e) => {
+            if (e.target === overlay) {
+                CustomModal.close();
+                overlay.onclick = null;
+            }
+        };
     },
+
     close: () => {
         if (CustomModal._timeoutId) clearTimeout(CustomModal._timeoutId);
 
@@ -93,25 +114,105 @@ const CustomModal = {
         CustomModal._timeoutId = setTimeout(() => {
             overlay.classList.remove('flex');
             overlay.classList.add('hidden');
+
+            // SENIOR FIX #15: Return focus
+            if (CustomModal._lastActiveElement) {
+                CustomModal._lastActiveElement.focus();
+                CustomModal._lastActiveElement = null;
+            }
         }, 150);
     }
 };
 
 document.addEventListener("DOMContentLoaded", async () => {
     elements.askBtn.addEventListener("click", handleAsk);
-    elements.questionInput.addEventListener("keypress", (e) => { if (e.key === 'Enter') handleAsk(); });
+    // SENIOR FIX #12: Changed 'keypress' to 'keydown'
+    elements.questionInput.addEventListener("keydown", (e) => { if (e.key === 'Enter') handleAsk(); });
     elements.validBtn.addEventListener("click", handleValidateReason);
     elements.generateReportBtn.addEventListener("click", handleGenerateReport);
 
     document.getElementById('refreshBtn').addEventListener("click", refreshTreeState);
     document.getElementById('newFolderBtn').addEventListener("click", handleCreateFolder);
     document.getElementById('newCaseBtn').addEventListener("click", handleCreateCase);
-    elements.caseId.addEventListener("change", resetCaseContext);
+
+    // SENIOR FIX #7: Guarding case switches if there is unsaved validated work
+    let previousCaseValue = elements.caseId.value;
+    elements.caseId.addEventListener("change", (e) => {
+        const newCaseValue = e.target.value;
+        if (verifiedFacts.length > 0) {
+            CustomModal.show(
+                "Unsaved Evidence",
+                "You have validated facts that haven't been synthesized into a report. Switching cases will discard them. Proceed?",
+                "confirm",
+                "Discard & Switch",
+                "bg-red-600 hover:bg-red-500",
+                () => {
+                    previousCaseValue = newCaseValue;
+                    resetCaseContext();
+                }
+            );
+            // Revert the dropdown if they cancel or close the modal
+            document.getElementById('modalCancel').addEventListener('click', () => { e.target.value = previousCaseValue; }, { once: true });
+            document.getElementById('modalOverlay').addEventListener('click', (ev) => { if(ev.target.id === 'modalOverlay') e.target.value = previousCaseValue; }, { once: true });
+            document.addEventListener('keydown', (ev) => { if(ev.key === 'Escape') e.target.value = previousCaseValue; }, { once: true });
+        } else {
+            previousCaseValue = newCaseValue;
+            resetCaseContext();
+        }
+    });
 
     document.getElementById('globalUploadBtn').addEventListener('click', handleGlobalUpload);
     document.getElementById('globalRenameBtn').addEventListener('click', handleGlobalRename);
     document.getElementById('globalDeleteBtn').addEventListener('click', handleGlobalDelete);
     document.getElementById('fileInput').addEventListener('change', window.handleUpload);
+
+    // SENIOR FIX #8: Event Delegation for dynamic tree clicks and checkboxes
+    elements.fileTreeContainer.addEventListener('click', (event) => {
+        // 1. Handle Checkboxes
+        if (event.target.matches('.context-checkbox')) {
+            const id = event.target.dataset.id;
+            const name = event.target.dataset.name;
+            const type = event.target.dataset.type;
+
+            if (event.target.checked) {
+                selectedContexts.set(id, { name: name, type: type });
+            } else {
+                selectedContexts.delete(id);
+            }
+            updateContextBanner();
+            return;
+        }
+
+        // 2. Handle Folder Expanders
+        const expanderBtn = event.target.closest('[data-role="expander"]');
+        const folderRow = event.target.closest('[data-role="folder-row"]');
+
+        if (expanderBtn || (folderRow && !event.target.matches('input[type="checkbox"]'))) {
+            const targetId = expanderBtn ? expanderBtn.dataset.folderId : folderRow.dataset.folderId;
+            toggleFolderExpander(targetId);
+        }
+    });
+
+    // Handle space/enter on rows for accessibility
+    elements.fileTreeContainer.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+            const fileRow = event.target.closest('[data-role="file-row"]');
+            if (fileRow) {
+                event.preventDefault();
+                const cb = fileRow.querySelector('input');
+                cb.checked = !cb.checked;
+                // Trigger the click logic defined in the delegate
+                cb.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                return;
+            }
+
+            const folderRow = event.target.closest('[data-role="folder-row"]');
+            if (folderRow) {
+                event.preventDefault();
+                toggleFolderExpander(folderRow.dataset.folderId);
+            }
+        }
+    });
 
     initViewControllers();
     await loadModels();
@@ -147,6 +248,9 @@ async function loadModels() {
 }
 
 function resetCaseContext() {
+    caseGeneration++; // SENIOR FIX #5: Increment generation
+    const myGen = caseGeneration;
+
     chatHistory = {};
     activeMessageId = null;
     verifiedFacts = [];
@@ -160,30 +264,19 @@ function resetCaseContext() {
     elements.reportContainer.innerHTML = `<p class="text-slate-500 italic">Click 'Go' to synthesize a complete case narrative based ONLY on validated evidence.</p>`;
     elements.validBtn.disabled = true;
 
-    loadRootDirectory();
+    loadRootDirectory(myGen);
 }
-
-window.toggleContextSelection = (event, id, name, type) => {
-    event.stopPropagation();
-    if (event.target.checked) {
-        selectedContexts.set(id, { name: name, type: type });
-    } else {
-        selectedContexts.delete(id);
-    }
-    updateContextBanner();
-};
 
 function updateContextBanner() {
     const displayElement = document.getElementById('activeContextDisplay');
     if (selectedContexts.size === 0) {
         displayElement.innerHTML = `<span class="bg-slate-800 px-2 py-1 rounded text-blue-300 shadow-inner">/Root (Entire Case)</span>`;
     } else {
-        // SENIOR FIX: Escape injected HTML payload
         let tagsHtml = Array.from(selectedContexts.values()).map(item => {
             const icon = item.type === 'folder' ? '📁' : getFileIcon(item.name);
-            return `<span class="bg-blue-900/80 border border-blue-500 text-blue-100 px-2 py-0.5 rounded text-[11px] mr-1 mb-1 inline-block shadow-sm">${icon} ${escapeHTML(item.name)}</span>`;
+            return `<span class="bg-blue-900/80 border border-blue-500 text-blue-100 px-2 py-0.5 rounded text-[11px] mr-1 mb-1 inline-flex items-center shadow-sm whitespace-nowrap">${icon} <span class="ml-1 truncate max-w-[150px]">${escapeHTML(item.name)}</span></span>`;
         }).join('');
-        displayElement.innerHTML = tagsHtml;
+        displayElement.innerHTML = `<div class="flex flex-wrap gap-1 w-full overflow-hidden">${tagsHtml}</div>`;
     }
 }
 
@@ -194,14 +287,16 @@ async function loadCases(selectTargetId = null) {
         window.activeCases = cases;
 
         if (cases.length === 0) {
-            elements.caseId.innerHTML = `<option value="DEFAULT-CASE">DEFAULT-CASE</option>`;
+            elements.caseId.innerHTML = `<option value="DEFAULT-CASE">No Cases Found</option>`;
             return;
         }
 
         elements.caseId.innerHTML = cases.map(c => `<option value="${escapeHTML(c.id)}">${escapeHTML(c.id)} - ${escapeHTML(c.name)}</option>`).join('');
         if (selectTargetId) elements.caseId.value = selectTargetId;
     } catch (e) {
-        elements.caseId.innerHTML = `<option value="DEFAULT-CASE">Offline Mode</option>`;
+        // SENIOR FIX #14: Distinguish offline mode from zero cases
+        console.error("Failed to load cases:", e);
+        elements.caseId.innerHTML = `<option value="DEFAULT-CASE" class="text-red-500">Offline Mode (Local Default)</option>`;
         window.activeCases = [];
     }
 }
@@ -216,18 +311,16 @@ async function handleCreateCase() {
         async (caseName) => {
             if (!caseName) return;
 
-            let caseId;
-            const cases = window.activeCases || [];
-            do {
-                caseId = "CASE-" + Math.floor(1000 + Math.random() * 9000);
-            } while (cases.some(c => c.id === caseId));
+            // SENIOR FIX #4: Generate UUIDs for strong, collision-resistant identity
+            const caseId = `CASE-${crypto.randomUUID()}`;
 
             try {
                 await ApiService.createTenant(caseId, caseName);
                 await loadCases(caseId);
                 resetCaseContext();
             } catch (e) {
-                CustomModal.show("Error", "Failed to create new case.", "alert", "OK", "bg-red-600", ()=>{});
+                console.error("Create Case Failed:", e);
+                CustomModal.show("Error", e.message || "Failed to create new case.", "alert", "OK", "bg-red-600", ()=>{});
             }
         }
     );
@@ -237,33 +330,33 @@ async function refreshTreeState() {
     const openFolders = Array.from(document.querySelectorAll('.tree-line:not(.hidden)'))
         .map(el => el.id.replace('children-', ''));
 
-    await loadRootDirectory();
+    const myGen = caseGeneration;
+    await loadRootDirectory(myGen);
 
     for (const folderId of openFolders) {
         if (folderId === 'root') continue;
         const childrenContainer = document.getElementById(`children-${folderId}`);
-        const expanderIcon = document.getElementById(`expander-${folderId}`);
+        const expanderIcon = document.querySelector(`[data-role="expander"][data-folder-id="${folderId}"]`);
 
         if (childrenContainer && childrenContainer.classList.contains('hidden')) {
             childrenContainer.classList.remove('hidden');
             if (expanderIcon) expanderIcon.innerText = '▼';
-            await expandFolder(folderId, childrenContainer);
+            await expandFolder(folderId, childrenContainer, myGen);
         }
     }
 }
 
-async function loadRootDirectory() {
-    // SENIOR FIX: Moved loading state to initial assignment to fix silent dead assignment
+async function loadRootDirectory(gen) {
     elements.fileTreeContainer.innerHTML = `
-        <div id="node-root" class="tree-node p-1.5 rounded flex items-center gap-2 border border-transparent">
+        <div data-role="folder-row" data-folder-id="root" class="tree-node p-1.5 rounded flex items-center gap-2 border border-transparent">
             <span class="text-slate-400">🗄️</span> 
-            <span class="font-bold text-blue-300">Case Root</span>
+            <span class="font-bold text-blue-300 cursor-default">Case Root</span>
         </div>
         <div id="children-root" class="tree-line">
             <div class="text-center text-slate-500 text-xs mt-2 animate-pulse">Loading Tree...</div>
         </div>
     `;
-    await expandFolder("root", document.getElementById("children-root"));
+    await expandFolder("root", document.getElementById("children-root"), gen);
 }
 
 function getFileIcon(filename) {
@@ -275,7 +368,7 @@ function getFileIcon(filename) {
     return '📄';
 }
 
-async function expandFolder(folderId, containerElement) {
+async function expandFolder(folderId, containerElement, gen = caseGeneration) {
     const caseId = elements.caseId.value;
 
     try {
@@ -284,24 +377,30 @@ async function expandFolder(folderId, containerElement) {
             ApiService.getFiles(folderId, caseId)
         ]);
 
+        // SENIOR FIX #5: Check if the user swapped cases while we were fetching
+        if (gen !== caseGeneration) return;
+
         containerElement.innerHTML = '';
         if (folders.length === 0 && files.length === 0) {
             containerElement.innerHTML = '<div class="text-slate-600 text-xs italic py-1">Empty</div>';
             return;
         }
 
+        // SENIOR FIX #8: Use data attributes for event delegation instead of inline handlers
         folders.forEach(folder => {
             const isChecked = selectedContexts.has(folder.id) ? 'checked' : '';
-            // SENIOR FIX: XSS protection and robust event parameters using dataset
+            const fId = escapeHTML(folder.id);
+            const fName = escapeHTML(folder.name);
+
             const folderHtml = `
                 <div class="mt-1">
-                    <div id="node-${folder.id}" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); toggleFolderExpander(event, '${folder.id}'); }" class="tree-node p-1 rounded flex items-center border border-transparent hover:bg-slate-700/50 focus:bg-slate-700/50 focus:outline-none transition-colors">
-                        <span id="expander-${folder.id}" onclick="toggleFolderExpander(event, '${folder.id}')" class="text-slate-400 hover:text-white cursor-pointer px-1 w-4 text-center shrink-0">▶</span>
-                        <input type="checkbox" ${isChecked} tabindex="-1" class="w-3 h-3 cursor-pointer shrink-0 accent-blue-500 mr-2 ml-1" onchange="toggleContextSelection(event, '${folder.id}', this.dataset.name, 'folder')" data-name="${escapeHTML(folder.name)}">
-                        <span class="text-yellow-500 shrink-0 text-sm mr-1 cursor-pointer" onclick="toggleFolderExpander(event, '${folder.id}')">📁</span> 
-                        <span class="text-sm text-slate-200 select-none pr-4 cursor-pointer" onclick="toggleFolderExpander(event, '${folder.id}')" title="${escapeHTML(folder.name)}">${escapeHTML(folder.name)}</span>
+                    <div data-role="folder-row" data-folder-id="${fId}" tabindex="0" role="button" class="tree-node p-1 rounded flex items-center border border-transparent hover:bg-slate-700/50 focus:bg-slate-700/50 focus:outline-none transition-colors cursor-pointer">
+                        <span data-role="expander" data-folder-id="${fId}" class="text-slate-400 hover:text-white px-1 w-4 text-center shrink-0">▶</span>
+                        <input type="checkbox" ${isChecked} tabindex="-1" class="w-3 h-3 cursor-pointer shrink-0 accent-blue-500 mr-2 ml-1 context-checkbox" data-id="${fId}" data-name="${fName}" data-type="folder">
+                        <span class="text-yellow-500 shrink-0 text-sm mr-1">📁</span> 
+                        <span class="text-sm text-slate-200 select-none pr-4 truncate" title="${fName}">${fName}</span>
                     </div>
-                    <div id="children-${folder.id}" class="tree-line hidden"></div>
+                    <div id="children-${fId}" class="tree-line hidden"></div>
                 </div>
             `;
             containerElement.insertAdjacentHTML('beforeend', folderHtml);
@@ -310,25 +409,31 @@ async function expandFolder(folderId, containerElement) {
         files.forEach(file => {
             const isChecked = selectedContexts.has(file.id) ? 'checked' : '';
             const icon = getFileIcon(file.fileName);
-            // SENIOR FIX: XSS protection and robust event parameters using dataset
+            const fId = escapeHTML(file.id);
+            const fName = escapeHTML(file.fileName);
+
             const fileHtml = `
-                <div tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); const cb = this.querySelector('input'); cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); }" class="py-1 px-2 flex items-center hover:bg-slate-700/30 focus:bg-slate-700/50 focus:outline-none rounded mt-1 transition-colors">
-                    <input type="checkbox" ${isChecked} tabindex="-1" class="w-3 h-3 cursor-pointer shrink-0 accent-blue-500 mr-2 ml-5" onchange="toggleContextSelection(event, '${file.id}', this.dataset.name, 'file')" data-name="${escapeHTML(file.fileName)}">
+                <div data-role="file-row" tabindex="0" role="button" class="py-1 px-2 flex items-center hover:bg-slate-700/30 focus:bg-slate-700/50 focus:outline-none rounded mt-1 transition-colors cursor-pointer">
+                    <input type="checkbox" ${isChecked} tabindex="-1" class="w-3 h-3 cursor-pointer shrink-0 accent-blue-500 mr-2 ml-5 context-checkbox" data-id="${fId}" data-name="${fName}" data-type="file">
                     <span class="text-xs shrink-0 mr-1 opacity-90">${icon}</span>
-                    <span class="text-xs select-text pr-4 break-words" title="${escapeHTML(file.fileName)}">${escapeHTML(file.fileName)}</span>
+                    <span class="text-xs select-text pr-4 break-words" title="${fName}">${fName}</span>
                 </div>
             `;
             containerElement.insertAdjacentHTML('beforeend', fileHtml);
         });
     } catch (error) {
-        containerElement.innerHTML = `<div class="text-red-400 text-xs">Error loading hierarchy</div>`;
+        console.error(`Failed to expand folder ${folderId}:`, error);
+        if (gen === caseGeneration) {
+            containerElement.innerHTML = `<div class="text-red-400 text-xs py-1">Error loading contents</div>`;
+        }
     }
 }
 
-window.toggleFolderExpander = async (event, folderId) => {
-    event.stopPropagation();
+async function toggleFolderExpander(folderId) {
     const childrenContainer = document.getElementById(`children-${folderId}`);
-    const expanderIcon = document.getElementById(`expander-${folderId}`);
+    const expanderIcon = document.querySelector(`[data-role="expander"][data-folder-id="${folderId}"]`);
+
+    if (!childrenContainer) return;
 
     if (childrenContainer.classList.contains('hidden')) {
         childrenContainer.classList.remove('hidden');
@@ -367,7 +472,8 @@ async function handleCreateFolder() {
                 await ApiService.createFolder(folderName.trim(), targetFolderId, elements.caseId.value);
                 await refreshTreeState();
             } catch (e) {
-                CustomModal.show("Error", "Failed to create folder.", "alert", "OK", "bg-red-600", ()=>{});
+                console.error("Folder creation failed:", e);
+                CustomModal.show("Error", e.message || "Failed to create folder.", "alert", "OK", "bg-red-600", ()=>{});
             }
         }
     );
@@ -398,6 +504,9 @@ window.handleUpload = async (event) => {
     const originalText = document.getElementById('activeContextDisplay').innerHTML;
     document.getElementById('activeContextDisplay').innerHTML = `<span class="text-yellow-400 font-bold bg-slate-800 px-2 py-1 rounded animate-pulse">Uploading ${files.length} items...</span>`;
 
+    // SENIOR FIX #3: Collect failures instead of overwriting the modal
+    const failures = [];
+
     for (let i = 0; i < files.length; i++) {
         try {
             const data = await ApiService.uploadEvidence(files[i], targetFolderId, elements.caseId.value);
@@ -408,30 +517,41 @@ window.handleUpload = async (event) => {
                 const streamTimeout = setTimeout(() => {
                     eventSource.close();
                     reject(new Error("Stream timed out from backend."));
-                }, 60000);
+                }, 600000);
 
-                eventSource.onmessage = (e) => {
+                eventSource.addEventListener('progress', (e) => {
                     if (e.data === 'Complete') {
                         clearTimeout(streamTimeout);
                         eventSource.close();
                         resolve();
                     }
-                };
+                });
+
+                // SENIOR FIX #3: Reject properly on stream loss
                 eventSource.onerror = () => {
                     clearTimeout(streamTimeout);
                     eventSource.close();
-                    resolve();
+                    reject(new Error("Connection to ingestion stream lost before completion."));
                 };
             });
         } catch (error) {
             console.error("Upload failed for", files[i].name, error);
-            CustomModal.show("Upload Issue", `Error processing: ${escapeHTML(files[i].name)}. Moving to next file.`, "alert", "OK", "bg-yellow-600", ()=>{});
+            failures.push({ name: files[i].name, message: error.message || "Unknown error" });
         }
     }
 
     event.target.value = '';
     document.getElementById('activeContextDisplay').innerHTML = originalText;
     await refreshTreeState();
+
+    if (failures.length > 0) {
+        const list = failures.map(f => `• ${escapeHTML(f.name)}: ${escapeHTML(f.message)}`).join('\n');
+        CustomModal.show(
+            failures.length === files.length ? "Upload Failed" : "Some Files Failed",
+            `${failures.length} of ${files.length} file(s) could not be processed:\n\n${list}`,
+            "alert", "OK", "bg-red-600", () => {}
+        );
+    }
 };
 
 async function handleGlobalRename() {
@@ -459,7 +579,8 @@ async function handleGlobalRename() {
                 updateContextBanner();
                 await refreshTreeState();
             } catch (e) {
-                CustomModal.show("Error", "Failed to rename folder. It might be locked by the system.", "alert", "OK", "bg-red-600", ()=>{});
+                console.error("Rename failed:", e);
+                CustomModal.show("Error", e.message || "Failed to rename folder.", "alert", "OK", "bg-red-600", ()=>{});
             }
         }
     );
@@ -489,6 +610,7 @@ async function handleGlobalDelete() {
                     }
                     successIds.push(id);
                 } catch (e) {
+                    console.error("Delete failed for item:", id, e);
                     hasError = true;
                 }
             }
@@ -526,6 +648,7 @@ async function handleAsk() {
         const data = await ApiService.askStructuredQuestion(question, targetFolderIds, elements.caseId.value, model);
         const msgId = "msg-" + Date.now();
         chatHistory[msgId] = {
+            question: question, // Keep track of the question asked
             answer: data.answer || "No conclusion drawn.",
             reasoning: data.reasoning || "No specific evidence cited.",
             isValidated: false
@@ -534,7 +657,8 @@ async function handleAsk() {
         updateChatBubble(loadingId, data.answer, msgId);
         selectMessage(msgId);
     } catch (error) {
-        updateChatBubble(loadingId, "Connection lost to AI core.", null);
+        console.error("AI Query Failed:", error);
+        updateChatBubble(loadingId, "Connection lost to AI core: " + (error.message || "Unknown Error"), null);
     } finally {
         elements.questionInput.disabled = false;
         elements.askBtn.disabled = false;
@@ -551,29 +675,49 @@ function selectMessage(msgId) {
     document.querySelectorAll('.chat-bubble').forEach(el => el.classList.remove('msg-active'));
     document.getElementById(msgId).classList.add('msg-active');
 
-    // SENIOR FIX: Securely render AI trace payload
+    // FIX 5: Apply the same aggressive wrapping to the Evidence Trace panel
     elements.reasonContainer.innerHTML = `
         <div class="font-mono text-blue-300 mb-2 border-b border-slate-600 pb-2">EVIDENCE TRACE:</div>
-        <div class="leading-relaxed whitespace-pre-wrap">${escapeHTML(msgData.reasoning)}</div>
+        <div class="leading-relaxed whitespace-pre-wrap min-w-0" style="word-break: break-word; overflow-wrap: anywhere;">${escapeHTML(msgData.reasoning)}</div>
     `;
 
     if (msgData.isValidated) {
-        elements.validBtn.disabled = true;
-        elements.validBtn.innerText = "✓ Validated";
+        elements.validBtn.disabled = false;
+        elements.validBtn.innerText = "✓ Validated (Click to Remove)";
         swapClass(elements.validBtn, 'bg-slate-300', 'bg-green-500');
+        swapClass(elements.validBtn, 'hover:bg-green-400', 'hover:bg-red-400');
     } else {
         elements.validBtn.disabled = false;
         elements.validBtn.innerText = "Valid";
         swapClass(elements.validBtn, 'bg-green-500', 'bg-slate-300');
+        swapClass(elements.validBtn, 'hover:bg-red-400', 'hover:bg-green-400');
     }
 }
 
 function handleValidateReason() {
-    if (!activeMessageId || !chatHistory[activeMessageId] || chatHistory[activeMessageId].isValidated) return;
-    chatHistory[activeMessageId].isValidated = true;
-    verifiedFacts.push(chatHistory[activeMessageId].reasoning);
+    if (!activeMessageId || !chatHistory[activeMessageId]) return;
+
+    const msgData = chatHistory[activeMessageId];
+
+    // SENIOR FIX #6: Maintain provenance and allow toggling Validation status
+    if (msgData.isValidated) {
+        // Un-validate
+        msgData.isValidated = false;
+        verifiedFacts = verifiedFacts.filter(fact => fact.messageId !== activeMessageId);
+    } else {
+        // Validate
+        msgData.isValidated = true;
+        verifiedFacts.push({
+            messageId: activeMessageId,
+            question: msgData.question,
+            answer: msgData.answer,
+            reasoning: msgData.reasoning,
+            validatedAt: new Date().toISOString()
+        });
+    }
+
     updateVerifiedCounter();
-    selectMessage(activeMessageId);
+    selectMessage(activeMessageId); // Re-render the button state
 }
 
 function updateVerifiedCounter() {
@@ -594,12 +738,14 @@ async function handleGenerateReport() {
 
     try {
         const model = elements.modelSelector.value;
-        const data = await ApiService.generateReport(verifiedFacts, elements.caseId.value, model);
+        const evidenceStrings = verifiedFacts.map(fact => `Q: ${fact.question} | A: ${fact.answer} | Cite: ${fact.reasoning}`);
+        const data = await ApiService.generateReport(evidenceStrings, elements.caseId.value, model);
 
-        // SENIOR FIX: Securely render AI synthesis payload
-        elements.reportContainer.innerHTML = `<div class="leading-relaxed">${escapeHTML(data.report)}</div>`;
+        // FIX 6: Apply aggressive wrapping to the Report Container
+        elements.reportContainer.innerHTML = `<div class="leading-relaxed whitespace-pre-wrap min-w-0" style="word-break: break-word; overflow-wrap: anywhere;">${escapeHTML(data.report)}</div>`;
     } catch (e) {
-        elements.reportContainer.innerHTML = `<div class="text-red-400">Failed to generate report. Backend unavailable.</div>`;
+        console.error("Report generation failed:", e);
+        elements.reportContainer.innerHTML = `<div class="text-red-400">Failed to generate report: ${escapeHTML(e.message)}</div>`;
     } finally {
         elements.generateReportBtn.disabled = false;
         elements.generateReportBtn.innerText = "Go (Generate)";
@@ -610,18 +756,43 @@ function appendToChat(role, message, msgId) {
     const isAI = role === 'AI';
     const tempId = msgId || "temp-" + Date.now();
     const msgDiv = document.createElement('div');
-    msgDiv.className = `flex ${isAI ? 'justify-start' : 'justify-end'}`;
+
+    // Row wrapper ensures the bubble aligns left or right
+    msgDiv.className = `flex ${isAI ? 'justify-start' : 'justify-end'} w-full mb-3 px-1`;
 
     const clickHandler = isAI ? `onclick="selectMessage('${tempId}')" style="cursor: pointer;"` : "";
-    const hoverFx = isAI ? "hover:border-blue-500 transition-colors" : "";
 
-    // SENIOR FIX: Securely render raw text message inside chat bubble
+    // Generate an inline timestamp (e.g., "7:27 PM")
+    const timeString = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    // WhatsApp Dark Mode Styling Logic
+    // isAI (Receiver): Slate-700 background, rounded with a sharp top-left corner
+    // Detective (Sender): WhatsApp teal (#005c4b), rounded with a sharp top-right corner
+    const bubbleStyle = isAI
+        ? "bg-slate-700 text-slate-200 rounded-2xl rounded-tl-sm border border-slate-600 hover:border-blue-400 transition-colors shadow-sm"
+        : "bg-[#005c4b] text-[#e9edef] rounded-2xl rounded-tr-sm shadow-sm";
+
+    // AI gets a colored name tag at the top of the bubble
+    const nameTag = isAI
+        ? `<span class="text-[11px] font-bold text-[#53bdeb] mb-0.5 tracking-wide">AI CORE</span>`
+        : ``;
+
+    // Time and Read Receipts inline at the bottom right
+    const timeTag = isAI
+        ? `<span class="text-[10px] text-slate-400">${timeString}</span>`
+        : `<span class="text-[10px] text-[#8696a0]">${timeString}</span><span class="text-[#53bdeb] text-xs ml-1 tracking-tighter leading-none">✓✓</span>`;
+
+    // THE CORE FIX: 'w-fit' shrinks the box to perfectly hug the text. 'max-w-[85%]' stops it from growing off-screen.
     msgDiv.innerHTML = `
-        <div id="${tempId}" ${clickHandler} class="chat-bubble max-w-[85%] rounded-lg px-4 py-2 border border-slate-700 ${isAI ? 'bg-slate-700 text-slate-200 ' + hoverFx : 'bg-blue-600 text-white border-blue-500'}">
-            <span class="text-[10px] font-bold block mb-1 uppercase ${isAI ? 'text-blue-300' : 'text-blue-200'}">${role}</span>
-            <span class="chat-text whitespace-pre-wrap text-sm">${escapeHTML(message)}</span>
+        <div id="${tempId}" ${clickHandler} class="chat-bubble flex flex-col w-fit max-w-[85%] px-3 pt-2 pb-1.5 ${bubbleStyle}">
+            ${nameTag}
+            <div class="chat-text text-[14px] leading-relaxed whitespace-pre-wrap" style="word-break: break-word; overflow-wrap: anywhere;">${escapeHTML(message)}</div>
+            <div class="flex justify-end items-end gap-1 mt-1 h-3 shrink-0">
+                ${timeTag}
+            </div>
         </div>
     `;
+
     elements.chatWindow.appendChild(msgDiv);
     elements.chatWindow.scrollTop = elements.chatWindow.scrollHeight;
     return tempId;
@@ -634,6 +805,7 @@ function updateChatBubble(elementId, newText, newRealId) {
         el.id = newRealId;
         el.setAttribute('onclick', `selectMessage('${newRealId}')`);
     }
+    // Update the text while preserving the WhatsApp timestamps
     el.querySelector('.chat-text').innerText = newText;
     elements.chatWindow.scrollTop = elements.chatWindow.scrollHeight;
 }

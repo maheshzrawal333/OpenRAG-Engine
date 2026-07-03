@@ -6,12 +6,26 @@ body {
 }
 
 /* Custom terminal scrollbar */
-.terminal-scroll::-webkit-scrollbar { width: 8px; }
-.terminal-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
-.terminal-scroll::-webkit-scrollbar-track { background: #0f172a; }
+.terminal-scroll::-webkit-scrollbar,
+.tree-container::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+.terminal-scroll::-webkit-scrollbar-thumb,
+.tree-container::-webkit-scrollbar-thumb {
+    background: #334155;
+    border-radius: 4px;
+}
+.terminal-scroll::-webkit-scrollbar-track,
+.tree-container::-webkit-scrollbar-track {
+    background: #0f172a;
+}
 
 /* Smooth transition for disabled states */
-input:disabled, button:disabled { opacity: 0.5; cursor: not-allowed; }
+input:disabled, button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
 
 /* Tree View Styles for Evidence Library */
 .tree-node {
@@ -21,15 +35,26 @@ input:disabled, button:disabled { opacity: 0.5; cursor: not-allowed; }
 .tree-node:hover {
     background-color: rgba(51, 65, 85, 0.5);
 }
-.tree-children {
-    position: relative;
+.tree-line {
+    border-left: 1px solid #475569;
+    margin-left: 0.6rem;
+    padding-left: 0.5rem;
 }
-.tree-children::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 0.75rem;
-    width: 1px;
-    background-color: #475569;
+
+/* Active State for Selected Evidence Chunks */
+.msg-active {
+    border: 2px solid #3b82f6 !important;
+    background-color: rgba(30, 41, 59, 0.8) !important;
+}
+
+/* Panel Animations */
+.panel-transition {
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* SENIOR FIX: The CSS classes required to force long unbroken text strings to wrap */
+.break-words-safe {
+    word-wrap: break-word;
+    word-break: break-word;
+    hyphens: auto;
 }
