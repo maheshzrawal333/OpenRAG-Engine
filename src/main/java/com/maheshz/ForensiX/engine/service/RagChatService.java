@@ -58,7 +58,7 @@ public class RagChatService {
      * Local LLMs (especially on standard dev machines) easily crash with OutOfMemory (OOM)
      * errors if the context window is overloaded. We strictly manage this by limiting the
      * hybrid search to the top 5 chunks. At roughly 500 tokens per chunk, this yields
-     * ~2,500 tokens of context, safely fitting inside a standard 4096 token window with
+     * ~2,500 tokens of context, safely fitting inside an expanded 8192 token window with
      * plenty of room for the system prompt and the generated response.
      *
      * @param request The sanitized DTO containing the user's query and folder constraints.
@@ -113,8 +113,9 @@ public class RagChatService {
                             // Force strict factuality for analytical queries
                             .withTemperature(config.getTemperature())
                             .withModel(config.getAiModelName())
-                            // Hard cap to prevent local hardware OOM crashes
-                            .withNumCtx(4096)
+                            // SENIOR FIX: Expanded to 8192 to safely accommodate 5 dense RAG chunks
+                            // (~2500 tokens) plus system prompts without throwing a 400 Context Length Error.
+                            .withNumCtx(8192)
                             .build())
                     .call()
                     .content();
@@ -170,9 +171,10 @@ public class RagChatService {
                 .user("Synthesize the final investigation report in detail.")
                 .system(systemPrompt)
                 .options(OllamaOptions.builder()
-                        .withTemperature(0.3) // Slightly elevated for narrative fluidity
+                        .withTemperature(0.3)
                         .withModel(config.getAiModelName())
-                        .withNumCtx(4096) // Stability fix
+                        // Pre-emptively safeguard the report generation endpoint as well
+                        .withNumCtx(8192)
                         .build())
                 .call()
                 .content();
