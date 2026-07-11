@@ -9,7 +9,6 @@
 [![Spring AI](https://img.shields.io/badge/Spring%20AI-1.0.0--M4-6DB33F.svg)](https://spring.io/projects/spring-ai)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-336791.svg)](https://github.com/pgvector/pgvector)
 [![Ollama](https://img.shields.io/badge/Ollama-Local%20Inference-000000.svg)](https://ollama.com)
-[![License](https://img.shields.io/badge/License-Unspecified-lightgrey.svg)](#license)
 
 </div>
 
@@ -27,8 +26,6 @@ The platform is built around three constraints that a typical RAG tutorial can i
 - **Zero-leakage multi-tenancy.** Every case is a "tenant." Isolation is enforced redundantly at the HTTP interceptor, the service layer, and inside the SQL itself, so a bug in any single layer can't leak evidence across cases.
 - **Human-verified provenance.** The AI is used to *search and summarize* — it is never trusted to *conclude*. A final case report can only be generated from facts an investigator has explicitly marked as verified, never from raw, unreviewed model output.
 
-> **⚠️ Before you deploy this anywhere but `localhost`:** authentication currently runs in an intentional development-bypass mode, and tenant isolation trusts a client-supplied header rather than a verified credential. Read [Security Model and Multi-Tenancy](#security-model-and-multi-tenancy) before pointing this at real evidence on a shared network.
-
 ## Table of Contents
 
 - [Overview](#overview)
@@ -41,10 +38,6 @@ The platform is built around three constraints that a typical RAG tutorial can i
 - [Configuration Reference](#configuration-reference)
 - [Usage Walkthrough](#usage-walkthrough)
 - [API Reference](#api-reference)
-- [Security Model and Multi-Tenancy](#security-model-and-multi-tenancy)
-- [Known Limitations and Roadmap](#known-limitations-and-roadmap)
-- [Testing](#testing)
-- [Contributing](#contributing)
 - [Author](#author)
 
 ## Key Features
@@ -286,51 +279,6 @@ All endpoints are prefixed by the application's base URL (default `http://localh
 |---|---|---|
 | `POST` | `/api/forensics/analyze` | Ask a question against the case's vector index |
 | `POST` | `/api/forensics/report` | Synthesize a report from verified facts only |
-
-## Security Model and Multi-Tenancy
-
-ForensiX enforces case ("tenant") isolation at three independent layers, so that a bug in any single one of them doesn't leak evidence across cases:
-
-1. **HTTP layer** — `TenantInterceptor` rejects any `/api/**` request missing an `X-Tenant-ID` header with a `400 Bad Request`, then binds the value to a `ThreadLocal` for the lifetime of the request (and clears it in `afterCompletion`, since Tomcat recycles worker threads across requests).
-2. **Application layer** — every service method and JPA query that touches case data takes an explicit `tenantId` parameter; nothing relies on ambient or global scope.
-3. **Data layer** — the `hybrid_search()` Postgres function and the bulk vector-cleanup queries filter on `tenant_id` inside the SQL itself, so isolation holds even if application-layer code has a bug.
-
-### ⚠️ Current state: development-mode authentication
-
-This project currently ships with Spring Security's `authorizeHttpRequests(...).anyRequest().permitAll()`, and the OAuth2/JWT resource server block is present in configuration but explicitly commented out in code. In this state, **anyone who can reach the API can supply any `X-Tenant-ID` they like and read or modify that case's evidence** — the header is trusted, not cryptographically verified. This is intentional for local evaluation and demos, but the application is **not** safe to expose on a shared network or the public internet as-is.
-
-Before any real deployment, at minimum:
-
-- Enable the OAuth2 resource server block in `SecurityConfig` and point `spring.security.oauth2.resourceserver.jwt.issuer-uri` at a real Identity Provider (the config already assumes a Keycloak-style realm).
-- Update `TenantInterceptor` to derive the tenant from a verified JWT claim instead of a raw, client-supplied header.
-- Move the frontend's bearer token out of `localStorage` (flagged directly in `api.js`) and into an `HttpOnly` cookie to reduce XSS exposure.
-- Replace the default MinIO/Postgres credentials (`minioadmin` / `postgres`) committed in `application.properties` with values from environment variables or a secrets manager.
-- Review whether the `RagChatService` system prompt — which frames the model as operating under law-enforcement authorization to reduce refusals when analyzing sensitive evidence — fits your organization's AI usage and compliance policies before relying on it for a real investigation.
-
-## Known Limitations and Roadmap
-
-- **Authentication is not yet enforced** — see [Security Model and Multi-Tenancy](#security-model-and-multi-tenancy) above.
-- **Tenant trust model relies on a client-supplied header**, not a cryptographic credential, until the OAuth2 migration lands.
-- **Postgres data isn't in a named Docker volume** in `docker-compose.yml` (the other three services are); a `docker-compose down` will not persist the relational/vector database unless you add one.
-- **Deleted evidence is purged from Postgres and pgvector but retained in MinIO** — likely intentional for a "cold vault" evidentiary-retention posture, but worth confirming against your own compliance requirements rather than assuming.
-- **Minimal automated test coverage** — the suite currently contains a single Spring context load test. The ingestion saga, the `hybrid_search()` SQL function, and the tenant-isolation boundary have no automated regression coverage yet.
-- **`commons-csv` is used but not declared.** `AsyncIngestionWorker` imports `org.apache.commons.csv`, but `commons-csv` is not listed as an explicit dependency in `pom.xml` — it's currently resolved transitively through another dependency. Pin it explicitly to avoid a surprise `NoClassDefFoundError` if an upstream dependency bump ever drops it.
-- **A stale logging category.** `application.properties` sets `logging.level.com.maheshz.openrag.engine=DEBUG`, but the actual package is `com.maheshz.ForensiX.engine` — so this line currently has no effect on application log verbosity.
-- **No `LICENSE` file** is currently included in the repository.
-
-## Testing
-
-The project currently ships one automated test — a Spring Boot context-load smoke test (`OpenRagEngineApplicationTests`) that verifies the application context wires up correctly. There is no unit or integration coverage yet for the ingestion saga, the hybrid search function, or the tenant-isolation boundary; these are strong first candidates if you're looking to contribute.
-
-For manual and end-to-end testing, `generate_data.py` (see [Getting Started](#getting-started)) produces a deterministic, multi-format case with known "golden clues" seeded at specific rows/lines/pages — useful for verifying that ingestion, chunking, and retrieval are all working correctly together.
-
-## Contributing
-
-This repository doesn't yet include a `CONTRIBUTING.md`. In the meantime:
-
-1. Fork the repository and create a feature branch.
-2. Keep changes consistent with the existing package-by-layer structure (`controller` / `service` / `repository` / `domain`) and the multi-tenancy invariants described above.
-3. Open a pull request describing the change and, where relevant, how you tested it.
 
 ## Author
 
